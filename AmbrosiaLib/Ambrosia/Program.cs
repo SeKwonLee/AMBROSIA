@@ -2279,6 +2279,7 @@ namespace Ambrosia
         public const string AmbrosiaControlOutputsName = "Ambrosiacontrolout";
         bool _persistLogs;
         int _numShards;
+        int _numDestShards;
         bool Sharded { get { return _numShards > 0; } }
 
         internal bool _createService;
@@ -2669,7 +2670,8 @@ namespace Ambrosia
         private async Task AttachToAsync(string toAttachTo)
         {
             var attachToTableRef = _tableClient.GetTableReference(toAttachTo + "Public");
-            var numDestShards = int.Parse(RetrievePublicServiceInfo(attachToTableRef, "NumShards"));
+            _numDestShards = int.Parse(RetrievePublicServiceInfo(attachToTableRef, "NumShards"));
+            var numDestShards = _numDestShards;
 
             var myShardNames = new List<string>();
             if (!Sharded)
@@ -3779,6 +3781,9 @@ namespace Ambrosia
         int _lastShuffleDestSize = -1; // must be negative because self-messages are encoded with a destination size of 0
         byte[] _lastShuffleDest = new byte[20];
         OutputConnectionRecord[] _lastShuffleShards = null;
+        int _lastShuffleDestSizeSelf = -1; // must be negative because self-messages are encoded with a destination size of 0
+        byte[] _lastShuffleDestSelf = new byte[20];
+        OutputConnectionRecord[] _lastShuffleShardsSelf = null;
         OutputConnectionRecord _shuffleOutputRecord = null;
 
         private OutputConnectionRecord[] CheckAndInitShardsMapping (ConcurrentDictionary<string, OutputConnectionRecord[]> shardedOutputs, string destination, int destBytesSize)
@@ -3790,8 +3795,7 @@ namespace Ambrosia
                 {
                     if (destBytesSize != 0) // non-self calls
                     {
-                        var attachToTableRef = _tableClient.GetTableReference(destination + "Public");
-                        var numDestShards = int.Parse(RetrievePublicServiceInfo(attachToTableRef, "NumShards"));
+                        var numDestShards = _numDestShards;
 
                         if (numDestShards > 1) // sharded destination
                         {
@@ -3830,8 +3834,7 @@ namespace Ambrosia
             {
                 if (destBytesSize != 0) // non-self calls
                 {
-                    var attachToTableRef = _tableClient.GetTableReference(destination + "Public");
-                    var numDestShards = int.Parse(RetrievePublicServiceInfo(attachToTableRef, "NumShards"));
+                    var numDestShards = _numDestShards;
 
                     if (numDestShards > 1) // sharded destination
                     {
@@ -3931,21 +3934,6 @@ namespace Ambrosia
             int destBytesSize = RpcBuffer.Buffer.ReadBufferedInt(sizeBytes + 1);
             var destOffset = sizeBytes + 1 + StreamCommunicator.IntSize(destBytesSize);
 
-            // Check to see if the _lastShuffleDest is the same as the one to process. Caching here avoids significant overhead.
-            if (_lastShuffleDest == null || (_lastShuffleDestSize != destBytesSize) || !EqualBytes(RpcBuffer.Buffer, destOffset, _lastShuffleDest, destBytesSize))
-            {
-                string destination;
-                if (_lastShuffleDest.Length < destBytesSize)
-                {
-                    _lastShuffleDest = new byte[destBytesSize];
-                }
-                Buffer.BlockCopy(RpcBuffer.Buffer, destOffset, _lastShuffleDest, 0, destBytesSize);
-                _lastShuffleDestSize = destBytesSize;
-                destination = Encoding.UTF8.GetString(RpcBuffer.Buffer, destOffset, destBytesSize);
-
-                _lastShuffleShards = CheckAndInitShardsMapping(_outputs, destination, destBytesSize);
-            }
-
             int restOfRPCOffset = destOffset + destBytesSize;
             int restOfRPCMessageSize = RpcBuffer.Length - restOfRPCOffset;
             var totalSize = StreamCommunicator.IntSize(1 + restOfRPCMessageSize) +
@@ -3954,13 +3942,58 @@ namespace Ambrosia
             var rpcType = RpcBuffer.Buffer[restOfRPCOffset + 1 + StreamCommunicator.IntSize(RpcBuffer.Buffer.ReadBufferedInt(restOfRPCOffset + 1))];
 
             if (destBytesSize != 0)
-                _shuffleOutputRecord = _lastShuffleShards[grainId % _lastShuffleShards.Length];
+            {
+                // Check to see if the _lastShuffleDest is the same as the one to process. Caching here avoids significant overhead.
+                if (_lastShuffleDest == null || (_lastShuffleDestSize != destBytesSize) || !EqualBytes(RpcBuffer.Buffer, destOffset, _lastShuffleDest, destBytesSize))
+                {
+                    string destination;
+                    if (_lastShuffleDest.Length < destBytesSize)
+                    {
+                        _lastShuffleDest = new byte[destBytesSize];
+                    }
+                    Buffer.BlockCopy(RpcBuffer.Buffer, destOffset, _lastShuffleDest, 0, destBytesSize);
+                    _lastShuffleDestSize = destBytesSize;
+                    destination = Encoding.UTF8.GetString(RpcBuffer.Buffer, destOffset, destBytesSize);
+
+                    _lastShuffleShards = CheckAndInitShardsMapping(_outputs, destination, destBytesSize);
+                }
+
+                if (destBytesSize != 0)
+                    _shuffleOutputRecord = _lastShuffleShards[grainId % _lastShuffleShards.Length];
+                else
+                {
+                    if (rpcType == (byte)RpcTypes.RpcType.Impulse)
+                        _shuffleOutputRecord = _lastShuffleShards[_shardID != -1 ? _shardID : 0];
+                    else
+                        _shuffleOutputRecord = _lastShuffleShards[grainId % _lastShuffleShards.Length];
+                }
+            }
             else
             {
-                if (rpcType == (byte)RpcTypes.RpcType.Impulse)
-                    _shuffleOutputRecord = _lastShuffleShards[_shardID != -1 ? _shardID : 0];
+                // Check to see if the _lastShuffleDest is the same as the one to process. Caching here avoids significant overhead.
+                if (_lastShuffleDestSelf == null || (_lastShuffleDestSizeSelf != destBytesSize) || !EqualBytes(RpcBuffer.Buffer, destOffset, _lastShuffleDestSelf, destBytesSize))
+                {
+                    string destination;
+                    if (_lastShuffleDestSelf.Length < destBytesSize)
+                    {
+                        _lastShuffleDestSelf = new byte[destBytesSize];
+                    }
+                    Buffer.BlockCopy(RpcBuffer.Buffer, destOffset, _lastShuffleDestSelf, 0, destBytesSize);
+                    _lastShuffleDestSizeSelf = destBytesSize;
+                    destination = Encoding.UTF8.GetString(RpcBuffer.Buffer, destOffset, destBytesSize);
+
+                    _lastShuffleShardsSelf = CheckAndInitShardsMapping(_outputs, destination, destBytesSize);
+                }
+
+                if (destBytesSize != 0)
+                    _shuffleOutputRecord = _lastShuffleShardsSelf[grainId % _lastShuffleShardsSelf.Length];
                 else
-                    _shuffleOutputRecord = _lastShuffleShards[grainId % _lastShuffleShards.Length];
+                {
+                    if (rpcType == (byte)RpcTypes.RpcType.Impulse)
+                        _shuffleOutputRecord = _lastShuffleShardsSelf[_shardID != -1 ? _shardID : 0];
+                    else
+                        _shuffleOutputRecord = _lastShuffleShardsSelf[grainId % _lastShuffleShardsSelf.Length];
+                }
             }
 
             // lock to avoid conflict and ensure maximum memory cleaning during replay. No possible conflict during primary operation
